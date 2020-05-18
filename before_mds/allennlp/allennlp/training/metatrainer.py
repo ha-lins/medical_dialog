@@ -42,7 +42,7 @@ class MetaTrainer(TrainerBase):
                  optimizer: torch.optim.Optimizer,
                  iterator: DataIterator,
                  train_datasets: List[Iterable[Instance]],
-                 validation_datasets: Optional[Iterable[Instance]] = None,
+                 validation_datasets: List[Iterable[Instance]] = None,
                  patience: Optional[int] = None,
                  validation_metric: str = "-loss",
                  validation_iterator: DataIterator = None,
@@ -65,7 +65,7 @@ class MetaTrainer(TrainerBase):
                  log_batch_size_period: Optional[int] = None,
                  moving_average: Optional[MovingAverage] = None,
                  # meta learner parameters
-                 meta_batches: int = 5,
+                 meta_batches: int = 200,
                  inner_steps: int = 1,
                  meta_batch_size: int = 3,
                  batch_norm = True,
@@ -101,7 +101,7 @@ class MetaTrainer(TrainerBase):
         self.inner_steps = inner_steps
         self.innerstepsize = .001
         self.meta_batch_size = meta_batch_size
-        self.meta_step_size = .01
+        self.meta_step_size = .1
         self.batch_norm = batch_norm
 
         if patience is None:  # no early stopping
@@ -217,15 +217,17 @@ class MetaTrainer(TrainerBase):
         # for batch in train_generators[0]:
         #     print('[info]batch is:{}'.format(batch))
 
-        task_wrap = Tqdm.tqdm(zip(train_generators[0], train_generators[1], train_generators[2]),
+        task_wrap = Tqdm.tqdm(zip(train_generators[0], train_generators[1], train_generators[2]), total=1)
                               # , train_generators[3], train_generators[4]), \
-                                            total=1)
-        for i, batch_group in enumerate(task_wrap):
-            for k in range(self.meta_batch_size):  # tasks per batch
-                total_loss += self.reptile_inner_update(batch_group[k][0])
 
-            new_weights.append(deepcopy(self.model.state_dict()))
-            self.model.load_state_dict({name: weights_before[name] for name in weights_before})
+        for i, batch_group in enumerate(task_wrap):
+            if not i:
+                for k in range(self.meta_batch_size):  # tasks per batch
+                    total_loss += self.reptile_inner_update(batch_group[k][0])
+                    new_weights.append(deepcopy(self.model.state_dict()))
+                    self.model.load_state_dict({name: weights_before[name] for name in weights_before})
+            else:
+                break
 
         weights_after = {name: new_weights[0][name] / float(self.meta_batch_size) for name in new_weights[0]}
         for i in range(1, self.meta_batch_size):
@@ -258,7 +260,6 @@ class MetaTrainer(TrainerBase):
         raw_generators = []
 
         # fix max number of batches 
-        # print('[info] num_training_batches is:{}'.format(num_training_batches))
         self._last_log = time.time()
         last_save_time = time.time()
 
@@ -272,7 +273,6 @@ class MetaTrainer(TrainerBase):
         
         cumulative_batch_size = 0
         for i in range(0, self.meta_batches):
-            print('[info] meta_batch is:{}'.format(i))
             train_generators = []
             for i, train_info in enumerate(self.train_data):
                 raw_train_generator = self.iterator(train_info,
@@ -360,41 +360,37 @@ class MetaTrainer(TrainerBase):
         Computes the validation loss. Returns it and the number of batches.
         """
         logger.info("Validating")
+        self.model.eval()
+
 
         # Replace parameter values with the shadow values from the moving averages.
         if self._moving_average is not None:
             self._moving_average.assign_average_value()
 
         if self._validation_iterator is not None:
-            val_iterator = self._validation_iterator
+            val_iterator = self._validation_iterator[0]
         else:
             val_iterator = self.iterator
 
         num_gpus = len(self._cuda_devices)
 
-        raw_val_generator = val_iterator(self._validation_data,
-                                         num_epochs=1,
-                                         shuffle=False)
-        val_generator = lazy_groups_of(raw_val_generator, num_gpus)
-        num_validation_batches = math.ceil(val_iterator.get_num_batches(self._validation_data)/num_gpus)
-        val_generator_tqdm = Tqdm.tqdm(val_generator,
+        valid_generators = []
+        for i, valid_info in enumerate(self._validation_data):
+            raw_val_generator = self.iterator(valid_info,
+                                                num_epochs=1,
+                                                shuffle=self.shuffle)
+            valid_generators.append(lazy_groups_of(raw_val_generator, num_gpus))
+
+        num_validation_batches = min(map(lambda i :math.ceil(val_iterator.get_num_batches(self._validation_data[i])/num_gpus), range(self.meta_batch_size)))
+        val_generator_tqdm = Tqdm.tqdm(zip(valid_generators[0], valid_generators[1], valid_generators[2]),
                                        total=num_validation_batches)
         print("val gene called")
         batches_this_epoch = 0
         val_loss = 0
-        try:
-            few_shot = val_generator.__next__()
-        except:
-            print("Error could not do few shot validation")
-            return batches_this_epoch, val_loss
-        # print('[info] few shot is:{}, len is:{}'.format(few_shot[0], len(few_shot)))
-        self.reptile_inner_update(few_shot[0])
-        self.model.eval()
-
-        with torch.no_grad():
-            for batch_group in val_generator_tqdm:
-                print('[info] batch_group is:{}'.format(len(batch_group)))
-                loss = self.batch_loss(batch_group[0], for_training=False)
+        
+        for i, batch_group in enumerate(val_generator_tqdm):
+            for k in range(self.meta_batch_size):  # tasks per batch
+                loss = self.batch_loss(batch_group[k][0], for_training=False)
                 if loss is not None:
                     # You shouldn't necessarily have to compute a loss for validation, so we allow for
                     # `loss` to be None.  We need to be careful, though - `batches_this_epoch` is
@@ -404,10 +400,10 @@ class MetaTrainer(TrainerBase):
                     batches_this_epoch += 1
                     val_loss += loss.detach().cpu().numpy()
 
-                # Update the description with the latest metrics
-                val_metrics = training_util.get_metrics(self.model, val_loss, batches_this_epoch)
-                description = training_util.description_from_metrics(val_metrics)
-                val_generator_tqdm.set_description(description, refresh=False)
+            # Update the description with the latest metrics
+            val_metrics = training_util.get_metrics(self.model, val_loss, batches_this_epoch)
+            description = training_util.description_from_metrics(val_metrics)
+            val_generator_tqdm.set_description(description, refresh=False)
 
         # Now restore the original parameter values.
         if self._moving_average is not None:
@@ -631,7 +627,6 @@ class MetaTrainer(TrainerBase):
         # model = Model.from_params(vocab=vocab, params=params.pop("model"))
         # iterator = DataIterator.from_params(params.pop("iterator"))
         # iterator.index_with(model.vocab)
-        print('[info]============================ metatrainer.from_params is running')
         pieces = MetaTrainerPieces.from_params(
             params, serialization_dir, recover, cache_directory, cache_prefix
         )
@@ -649,7 +644,6 @@ class MetaTrainer(TrainerBase):
         shuffle = params.pop_bool("shuffle", True)
         num_epochs = params.pop_int("num_epochs", 20)
         cuda_device = parse_cuda_device(params.pop("cuda_device", [0,1]))
-        # print('[info]cuda_device in metatrainer is:{}'.format(cuda_device))
 
 
         grad_norm = params.pop_float("grad_norm", None)
