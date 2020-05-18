@@ -2,7 +2,7 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
-      <module fileurl="file://$PROJECT_DIR$/.idea/allennlp.iml" filepath="$PROJECT_DIR$/.idea/allennlp.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/medical_dialog.iml" filepath="$PROJECT_DIR$/.idea/medical_dialog.iml" />
     </modules>
   </component>
 </project>
